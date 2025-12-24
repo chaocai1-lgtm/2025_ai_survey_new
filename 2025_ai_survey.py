@@ -102,3 +102,6 @@ if st.button("🚀 确认提交并同步到飞书", type="primary", use_containe
                         log_area.error(f"飞书返回错误码: {r.get('code')}")
                         log_area.json(r)
                         st.info("💡 提示：请检查飞书表头名称是否为 '姓名', 'Q1'...'Q6', '时间'，并且机器人已添加至管理列表。")
+            except Exception as e:
+                st.error(f"❌ 发生错误: {str(e)}")
+                log_area.error(f"异常详情: {str(e)}")
