@@ -1,38 +1,47 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 from neo4j import GraphDatabase
+from pyecharts import options as opts
+from pyecharts.charts import Bar, Pie
+from streamlit_echarts import st_pyecharts
 import pandas as pd
 import datetime
 import time
 import requests
 import json
-from streamlit_autorefresh import st_autorefresh
-from streamlit_echarts import st_pyecharts
-from pyecharts import options as opts
-from pyecharts.charts import Bar, Pie
 
-# ================= 1. 核心配置信息 =================
-# 飞书凭证 (已验证可用)
+# ✨✨✨ 新增库：用于自动刷新 ✨✨✨
+from streamlit_autorefresh import st_autorefresh
+
+# ================= 1. 配置与连接 =================
+# 飞书配置 (已验证可用)
 FEISHU_APP_ID = "cli_a9c143778f78dbde"
 FEISHU_APP_SECRET = "ffQcE9o4TnJzR7JC1Myt5epc3b6MQdnq"
 FEISHU_APP_TOKEN = "GaNbbhWI9a3OwMsTz8scxeM7n2g"
 FEISHU_TABLE_ID = "tblPnIHK49IxILKm"
 
-# Neo4j 凭证
-NEO4J_URI = st.secrets.get("NEO4J_URI", "neo4j+ssc://7eb127cc.databases.neo4j.io")
-NEO4J_USER = st.secrets.get("NEO4J_USERNAME", "neo4j")
-NEO4J_PWD = st.secrets.get("NEO4J_PASSWORD", "wE7pV36hqNSo43mpbjTlfzE7n99NWcYABDFqUGvgSrk")
-ADMIN_PWD = st.secrets.get("ADMIN_PASSWORD", "admin888")
+# Neo4j 配置
+try:
+    if st.secrets and "NEO4J_URI" in st.secrets:
+        URI = st.secrets["NEO4J_URI"]
+        AUTH = ("neo4j", st.secrets["NEO4J_PASSWORD"])
+        ADMIN_PWD = st.secrets.get("ADMIN_PASSWORD", "admin888")
+    else:
+        raise Exception("No secrets config")
+except Exception:
+    URI = "neo4j+ssc://7eb127cc.databases.neo4j.io"
+    AUTH = ("neo4j", "wE7pV36hqNSo43mpbjTlfzE7n99NWcYABDFqUGvgSrk")
+    ADMIN_PWD = "admin888"
 
-# 数据库连接驱动
+# 数据库连接缓存
 @st.cache_resource
 def get_driver():
     try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PWD))
+        driver = GraphDatabase.driver(URI, auth=AUTH)
         driver.verify_connectivity()
         return driver
     except Exception as e:
-        st.warning(f"⚠️ Neo4j 连接失败: {e}，将仅使用飞书存储")
+        st.error(f"❌ 无法连接数据库: {e}")
         return None
 
 # ================= 2. 问卷题目定义 =================
@@ -45,26 +54,21 @@ QUESTIONS = {
     "q6": {"title": "6. 您对本次AI培训最期待的收获是什么？", "type": "single", "options": ["A. 了解AI概念趋势", "B. 掌握实用工具", "C. 学习写提示词", "D. 看教学案例", "E. 现场实操指导"]}
 }
 
-# ================= 3. 飞书服务逻辑 =================
+# ================= 3. 飞书同步服务 =================
 class FeishuService:
     @staticmethod
     def get_token():
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         try:
             r = requests.post(url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=10)
-            res_json = r.json()
-            if res_json.get("code") != 0:
-                st.error(f"飞书鉴权失败: {res_json.get('msg')}")
-                return None
-            return res_json.get("tenant_access_token")
-        except Exception as e:
-            st.error(f"飞书Token获取网络错误: {e}")
+            return r.json().get("tenant_access_token")
+        except:
             return None
 
     @staticmethod
     def push_data(name, answers):
         token = FeishuService.get_token()
-        if not token: 
+        if not token:
             return False
         
         api_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records"
@@ -90,157 +94,244 @@ class FeishuService:
         
         try:
             res = requests.post(api_url, headers=headers, json=payload, timeout=10)
-            res_json = res.json()
-            if res_json.get("code") != 0:
-                st.error(f"飞书同步报错: {res_json.get('msg')} (代码: {res_json.get('code')})")
-                st.info("💡 提示：请检查飞书列名是否被改动，或机器人是否已添加至该多维表格。")
-                return False
-            return True
-        except Exception as e:
-            st.error(f"同步飞书时发生网络异常: {e}")
+            return res.json().get("code") == 0
+        except:
             return False
 
-# ================= 4. 后端核心逻辑 =================
+# ================= 4. 后端逻辑 =================
 class SurveyBackend:
     def __init__(self):
         self.driver = get_driver()
 
     def submit_response(self, name, answers):
-        # 1. 存入 Neo4j (如果可用)
+        # 1. 存入 Neo4j
         if self.driver:
-            try:
-                with self.driver.session() as session:
-                    query = """CREATE (r:SurveyResponse {name: $name, submitted_at: datetime(), 
-                               q1: $q1, q2: $q2, q3: $q3, q4: $q4, q5: $q5, q6: $q6})"""
-                    session.run(query, name=name, **answers)
-            except Exception as e:
-                st.warning(f"Neo4j 存储失败: {e}")
+            with self.driver.session() as session:
+                query = """CREATE (r:SurveyResponse {name: $name, submitted_at: datetime(), q1: $q1, q2: $q2, q3: $q3, q4: $q4, q5: $q5, q6: $q6})"""
+                session.run(query, name=name, **answers)
         
-        # 2. 存入 飞书
-        with st.spinner("🚀 正在同步数据至飞书..."):
-            success = FeishuService.push_data(name, answers)
-            if success:
-                st.toast("✅ 飞书同步成功！")
-                return True
-            return False
+        # 2. ✨ 同步到飞书多维表格 ✨
+        feishu_success = FeishuService.push_data(name, answers)
+        return feishu_success
 
     def get_all_data(self):
-        if not self.driver: 
+        if not self.driver:
             return []
-        try:
-            with self.driver.session() as session:
-                result = session.run("MATCH (r:SurveyResponse) RETURN r ORDER BY r.submitted_at DESC")
-                data = [dict(record['r']) for record in result]
-                for d in data:
-                    if 'submitted_at' in d:
-                        d['submitted_at'] = d['submitted_at'].iso_format().split('.')[0].replace('T', ' ')
-                return data
-        except Exception as e:
-            st.error(f"获取数据失败: {e}")
-            return []
+        with self.driver.session() as session:
+            result = session.run("MATCH (r:SurveyResponse) RETURN r ORDER BY r.submitted_at DESC")
+            data = [dict(record['r']) for record in result]
+            for d in data:
+                if 'submitted_at' in d:
+                    d['submitted_at'] = d['submitted_at'].iso_format().split('.')[0].replace('T', ' ')
+            return data
+
+    def reset_database(self):
+        if not self.driver:
+            return
+        with self.driver.session() as session:
+            result = session.run("MATCH (r:SurveyResponse) DETACH DELETE r")
+            result.consume()
 
 # ================= 5. 可视化组件 =================
 def plot_pie(df, col, title):
-    if df.empty: 
+    if df.empty:
         return None
     counts = df[col].value_counts()
     data_pair = [list(z) for z in zip(counts.index.tolist(), counts.values.tolist())]
-    return (Pie().add("", data_pair, radius=["35%", "60%"])
-            .set_global_opts(title_opts=opts.TitleOpts(title=title, pos_left="center"))
+    return (Pie(init_opts=opts.InitOpts(width="100%"))
+            .add("", data_pair, radius=["35%", "60%"])
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title=title, pos_left="center"),
+                legend_opts=opts.LegendOpts(orient="vertical", pos_left="left", type_="scroll")
+            )
             .set_series_opts(label_opts=opts.LabelOpts(formatter="{b}: {c} ({d}%)")))
 
 def plot_bar(df, col, title):
-    if df.empty: 
+    if df.empty:
         return None
     all_options = [item for sublist in df[col] for item in (sublist if isinstance(sublist, list) else [sublist])]
-    if not all_options: 
+    if not all_options:
         return None
     counts = pd.Series(all_options).value_counts().sort_values(ascending=True)
-    return (Bar().add_xaxis(counts.index.tolist()).add_yaxis("人数", counts.values.tolist())
-            .reversal_axis().set_global_opts(title_opts=opts.TitleOpts(title=title)))
+    return (Bar(init_opts=opts.InitOpts(width="100%"))
+            .add_xaxis(counts.index.tolist())
+            .add_yaxis("人数", counts.values.tolist(), color="#5470c6")
+            .reversal_axis()
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title=title),
+                xaxis_opts=opts.AxisOpts(name="人数"),
+                yaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(interval=0))
+            )
+            .set_series_opts(label_opts=opts.LabelOpts(position="right")))
 
-# ================= 6. 主程序 UI 界面 =================
+# ================= 6. 主程序界面 =================
 st.set_page_config(page_title="AI 调研问卷", page_icon="📝", layout="wide")
 app = SurveyBackend()
 
-# 侧边栏导航
+st.markdown("""
+<style>
+    div[data-testid="stCheckbox"] { margin-bottom: -12px !important; min-height: auto; }
+    div[data-testid="stRadio"] > div { gap: 6px !important; }
+    .question-title { font-size: 16px; font-weight: 600; color: #333; margin-top: 25px; margin-bottom: 10px; }
+    .stButton { margin-top: 20px; }
+</style>
+""", unsafe_allow_html=True)
+
+if 'admin_auth' not in st.session_state:
+    st.session_state['admin_auth'] = False
+
 with st.sidebar:
     st.title("📝 问卷系统")
     role = st.radio("当前身份", ["👨‍🏫 我是老师 (填报)", "🔧 管理员后台 (查看)"])
 
-# 场景 A：填报界面
+    if role == "🔧 管理员后台 (查看)":
+        if not st.session_state['admin_auth']:
+            pwd = st.text_input("请输入管理密码", type="password")
+            if st.button("🔐 确认登录"):
+                if pwd == ADMIN_PWD:
+                    st.session_state['admin_auth'] = True
+                    st.success("登录成功")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("密码错误")
+        else:
+            st.success("✅ 管理员已登录")
+            
+            # ✨✨✨ 新增功能：自动刷新开关 ✨✨✨
+            st.markdown("---")
+            do_refresh = st.toggle("⚡ 开启实时刷新 (5s)", value=True)
+            if st.button("退出登录"):
+                st.session_state['admin_auth'] = False
+                st.rerun()
+
+# --- 场景 A：教师/学员填报 ---
 if role == "👨‍🏫 我是老师 (填报)":
-    st.header("📋 AI使用情况课前调研问卷")
-    st.info("老师您好！数据将实时同步至分析系统，请放心填写。")
-    
+    st.header("🤖 AI使用情况课前调研问卷")
+    st.markdown("老师您好！请填写以下问卷，带 * 号为必选。数据将同步至飞书多维表格。")
+    st.markdown("---")
+
     with st.form("survey_form"):
         st.subheader("基本信息")
         name = st.text_input("请输入您的姓名 *", placeholder="必填")
 
         st.subheader("问卷内容")
-        # 渲染题目
-        a1 = st.radio(QUESTIONS["q1"]["title"] + " *", QUESTIONS["q1"]["options"], index=None)
         
-        st.markdown(f"**{QUESTIONS['q2']['title']}**")
-        a2 = [opt for opt in QUESTIONS["q2"]["options"] if st.checkbox(opt, key=f"q2_{opt}")]
-        
-        st.markdown(f"**{QUESTIONS['q3']['title']}**")
-        a3 = [opt for opt in QUESTIONS["q3"]["options"] if st.checkbox(opt, key=f"q3_{opt}")]
-        
-        st.markdown(f"**{QUESTIONS['q4']['title']}**")
-        a4 = [opt for opt in QUESTIONS["q4"]["options"] if st.checkbox(opt, key=f"q4_{opt}")]
-        
-        a5 = st.radio(QUESTIONS["q5"]["title"] + " *", QUESTIONS["q5"]["options"], index=None)
-        a6 = st.radio(QUESTIONS["q6"]["title"] + " *", QUESTIONS["q6"]["options"], index=None)
+        def render_question(q_key, is_required=False):
+            q = QUESTIONS[q_key]
+            title_text = q['title'] + (" *" if is_required else "")
+            st.markdown(f'<p class="question-title">{title_text}</p>', unsafe_allow_html=True)
+            if q['type'] == 'single':
+                return st.radio("label_hidden", q['options'], index=None, label_visibility="collapsed")
+            elif q['type'] == 'multi':
+                selected = []
+                for opt in q['options']:
+                    if st.checkbox(opt, key=f"{q_key}_{opt}"):
+                        selected.append(opt)
+                return selected
+
+        a1 = render_question("q1", True)
+        a2 = render_question("q2", False)
+        a3 = render_question("q3", False)
+        a4 = render_question("q4", False)
+        a5 = render_question("q5", True)
+        a6 = render_question("q6", True)
 
         submitted = st.form_submit_button("✅ 提交问卷", type="primary", use_container_width=True)
 
         if submitted:
-            if not name.strip() or not a1 or not a5 or not a6:
-                st.error("⚠️ 姓名和所有单选题（带*号）均为必填项！")
+            if not name.strip():
+                st.error("⚠️ 姓名不能为空！")
+            elif a1 is None:
+                st.error("⚠️ 第1题尚未选择！")
+            elif a5 is None:
+                st.error("⚠️ 第5题尚未选择！")
+            elif a6 is None:
+                st.error("⚠️ 第6题尚未选择！")
             else:
                 answers = {"q1": a1, "q2": a2, "q3": a3, "q4": a4, "q5": a5, "q6": a6}
-                if app.submit_response(name.strip(), answers):
-                    st.success(f"🎉 提交成功！谢谢 {name.strip()} 老师。")
-                    st.balloons()
+                with st.spinner("提交中，正在同步至飞书..."):
+                    feishu_ok = app.submit_response(name.strip(), answers)
+                
+                if feishu_ok:
+                    st.success(f"🎉 提交成功！谢谢 {name.strip()} 老师。数据已同步至 Neo4j 和飞书。")
+                else:
+                    st.warning(f"⚠️ 提交成功！但飞书同步失败，请联系管理员。")
+                st.balloons()
 
-# 场景 B：管理后台
+# --- 场景 B：管理员后台 ---
 elif role == "🔧 管理员后台 (查看)":
-    pwd = st.sidebar.text_input("管理密码", type="password")
-    if pwd == ADMIN_PWD:
-        st.title("📊 调研结果实时看板")
-        # 自动刷新
-        st_autorefresh(interval=10000, key="data_refresh")
+    if st.session_state['admin_auth']:
         
+        # ✨✨✨ 注入自动刷新逻辑 ✨✨✨
+        if do_refresh:
+            st_autorefresh(interval=5000, limit=None, key="admin_dashboard_refresh")
+
+        st.title("📊 调研结果看板")
         raw_data = app.get_all_data()
         df = pd.DataFrame(raw_data)
         
+        col_k1, col_k2, col_k3 = st.columns(3)
+        col_k1.metric("已填报人数", len(df))
+        col_k2.metric("最新提交", df.iloc[0]['name'] if not df.empty else "-")
+        col_k3.metric("最后同步", datetime.datetime.now().strftime("%H:%M:%S"))
+        
         if not df.empty:
-            st.metric("已成功参与人数", len(df))
-            tab1, tab2 = st.tabs(["📈 图表可视化", "📋 原始数据明细"])
+            tab1, tab2, tab3 = st.tabs(["📈 图表分析", "📋 原始数据", "⚙️ 管理"])
             
             with tab1:
-                col1, col2 = st.columns(2)
-                with col1:
-                    chart = plot_pie(df, "q1", "AI 熟悉度分布")
-                    if chart:
-                        st_pyecharts(chart, height="400px")
-                with col2:
-                    chart = plot_pie(df, "q5", "核心困难分布")
-                    if chart:
-                        st_pyecharts(chart, height="400px")
+                st.info("💡 提示：看板每 5 秒自动刷新数据。")
                 
-                st.divider()
-                chart = plot_bar(df, "q2", "教师 Top 需求场景")
+                st.markdown("#### Q1: AI 熟悉程度")
+                chart = plot_pie(df, "q1", "")
                 if chart:
                     st_pyecharts(chart, height="400px")
-            
+                st.divider()
+
+                st.markdown("#### Q2: Top 需求")
+                chart = plot_bar(df, "q2", "")
+                if chart:
+                    st_pyecharts(chart, height="400px")
+                st.divider()
+
+                st.markdown("#### Q3: 熟悉的工具")
+                chart = plot_bar(df, "q3", "")
+                if chart:
+                    st_pyecharts(chart, height="400px")
+                st.divider()
+
+                st.markdown("#### Q4: 大语言模型分布")
+                chart = plot_bar(df, "q4", "")
+                if chart:
+                    st_pyecharts(chart, height="500px")
+                st.divider()
+
+                st.markdown("#### Q5: 最大困难")
+                chart = plot_pie(df, "q5", "")
+                if chart:
+                    st_pyecharts(chart, height="400px")
+                st.divider()
+
+                st.markdown("#### Q6: 期待收获")
+                chart = plot_pie(df, "q6", "")
+                if chart:
+                    st_pyecharts(chart, height="400px")
+
             with tab2:
                 st.dataframe(df, use_container_width=True)
-                st.download_button("📥 导出 CSV 备份", df.to_csv(index=False).encode('utf-8-sig'), "survey_export.csv")
+                st.download_button("📥 下载 .csv", df.to_csv(index=False).encode('utf-8-sig'), "data.csv")
+            
+            with tab3:
+                st.warning("⚠️ 危险区域")
+                confirm_clear = st.checkbox("我确认要清空所有数据", key="confirm_delete")
+                if confirm_clear:
+                    if st.button("🔴 立即清空数据库", type="primary"):
+                        app.reset_database()
+                        st.toast("🗑️ 数据库已清空")
+                        time.sleep(1)
+                        st.rerun()
         else:
-            st.info("目前还没有老师填写问卷哦。")
-    elif pwd != "":
-        st.error("密码不正确！")
-    else:
-        st.warning("请输入侧边栏的管理密码以查看看板")
+            st.info("暂无数据，等待填报...")
+            if st.button("强制重置数据库"):
+                app.reset_database()
+                st.rerun()
