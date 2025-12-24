@@ -1,0 +1,7 @@
+streamlit
+neo4j
+pyecharts
+streamlit-echarts
+pandas
+streamlit-autorefresh
+requests
