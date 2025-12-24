@@ -5,23 +5,25 @@ import datetime
 import time
 import requests
 import json
-# ✨ 新增：用于自动刷新和图表
 from streamlit_autorefresh import st_autorefresh
 from streamlit_echarts import st_pyecharts
 from pyecharts import options as opts
 from pyecharts.charts import Bar, Pie
 
-# ================= 1. 配置与连接 (优先从 Secrets 读取) =================
+# ================= 1. 核心配置信息 =================
+# 飞书凭证
 FEISHU_APP_ID = st.secrets.get("FEISHU_APP_ID", "cli_a9c1c59555f81ceb")
 FEISHU_APP_SECRET = st.secrets.get("FEISHU_APP_SECRET", "ldR79n02WB6CeA7OVA39af05RFXgEJqG")
 FEISHU_APP_TOKEN = "BUCGbklpfaOob5soBs0cLnxDn5f"
 FEISHU_TABLE_ID = "tblmi3cmtBGbTZJP"
 
+# Neo4j 凭证
 NEO4J_URI = st.secrets.get("NEO4J_URI", "neo4j+ssc://7eb127cc.databases.neo4j.io")
 NEO4J_USER = st.secrets.get("NEO4J_USERNAME", "neo4j")
 NEO4J_PWD = st.secrets.get("NEO4J_PASSWORD", "wE7pV36hqNSo43mpbjTlfzE7n99NWcYABDFqUGvgSrk")
 ADMIN_PWD = st.secrets.get("ADMIN_PASSWORD", "admin888")
 
+# 数据库连接驱动
 @st.cache_resource
 def get_driver():
     try:
@@ -29,7 +31,7 @@ def get_driver():
         driver.verify_connectivity()
         return driver
     except Exception as e:
-        st.error(f"❌ 数据库连接失败: {e}")
+        st.error(f"❌ Neo4j 连接失败: {e}")
         return None
 
 # ================= 2. 问卷题目定义 =================
@@ -42,20 +44,27 @@ QUESTIONS = {
     "q6": {"title": "6. 您对本次AI培训最期待的收获是什么？", "type": "single", "options": ["A. 了解AI概念趋势", "B. 掌握实用工具", "C. 学习写提示词", "D. 看教学案例", "E. 现场实操指导"]}
 }
 
-# ================= 3. 飞书同步服务 =================
+# ================= 3. 飞书服务逻辑 (带详细报错) =================
 class FeishuService:
     @staticmethod
     def get_token():
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         try:
             r = requests.post(url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET})
-            return r.json().get("tenant_access_token")
-        except: return None
+            res_json = r.json()
+            if res_json.get("code") != 0:
+                st.error(f"飞书鉴权失败: {res_json.get('msg')}")
+                return None
+            return res_json.get("tenant_access_token")
+        except Exception as e:
+            st.error(f"飞书Token获取网络错误: {e}")
+            return None
 
     @staticmethod
     def push_data(name, answers):
         token = FeishuService.get_token()
         if not token: return False
+        
         api_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
         
@@ -64,33 +73,52 @@ class FeishuService:
             ans = "、".join(val) if isinstance(val, list) else (val if val else "未选")
             return f"题目：{title}\n回答：{ans}"
 
-        payload = {"fields": {
-            "姓名": name,
-            "Q1": format_cell("q1", answers.get("q1")),
-            "Q2": format_cell("q2", answers.get("q2")),
-            "Q3": format_cell("q3", answers.get("q3")),
-            "Q4": format_cell("q4", answers.get("q4")),
-            "Q5": format_cell("q5", answers.get("q5")),
-            "Q6": format_cell("q6", answers.get("q6")),
-            "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        }}
+        # 🚀 重要：请确保这些 key ("姓名", "Q1"...) 与飞书表头完全一致
+        payload = {
+            "fields": {
+                "姓名": name,
+                "Q1": format_cell("q1", answers.get("q1")),
+                "Q2": format_cell("q2", answers.get("q2")),
+                "Q3": format_cell("q3", answers.get("q3")),
+                "Q4": format_cell("q4", answers.get("q4")),
+                "Q5": format_cell("q5", answers.get("q5")),
+                "Q6": format_cell("q6", answers.get("q6")),
+                "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+        }
+        
         try:
             res = requests.post(api_url, headers=headers, json=payload)
-            return res.json().get("code") == 0
-        except: return False
+            res_json = res.json()
+            if res_json.get("code") != 0:
+                st.error(f"飞书同步报错: {res_json.get('msg')} (代码: {res_json.get('code')})")
+                st.info("💡 提示：请检查飞书列名是否被改动，或机器人是否已添加至该多维表格。")
+                return False
+            return True
+        except Exception as e:
+            st.error(f"同步飞书时发生网络异常: {e}")
+            return False
 
-# ================= 4. 后端逻辑类 =================
+# ================= 4. 后端核心逻辑 =================
 class SurveyBackend:
     def __init__(self):
         self.driver = get_driver()
 
     def submit_response(self, name, answers):
+        # 1. 存入 Neo4j
         if self.driver:
             with self.driver.session() as session:
                 query = """CREATE (r:SurveyResponse {name: $name, submitted_at: datetime(), 
                            q1: $q1, q2: $q2, q3: $q3, q4: $q4, q5: $q5, q6: $q6})"""
                 session.run(query, name=name, **answers)
-        FeishuService.push_data(name, answers)
+        
+        # 2. 存入 飞书
+        with st.spinner("🚀 正在同步数据至飞书..."):
+            success = FeishuService.push_data(name, answers)
+            if success:
+                st.toast("✅ 飞书同步成功！")
+                return True
+            return False
 
     def get_all_data(self):
         if not self.driver: return []
@@ -119,53 +147,83 @@ def plot_bar(df, col, title):
     return (Bar().add_xaxis(counts.index.tolist()).add_yaxis("人数", counts.values.tolist())
             .reversal_axis().set_global_opts(title_opts=opts.TitleOpts(title=title)))
 
-# ================= 6. 主程序界面 (UI 渲染部分) =================
+# ================= 6. 主程序 UI 界面 =================
 st.set_page_config(page_title="AI 调研问卷", page_icon="📝", layout="wide")
 app = SurveyBackend()
 
+# 侧边栏导航
 with st.sidebar:
     st.title("📝 问卷系统")
     role = st.radio("当前身份", ["👨‍🏫 我是老师 (填报)", "🔧 管理员后台 (查看)"])
 
+# 场景 A：填报界面
 if role == "👨‍🏫 我是老师 (填报)":
     st.header("🤖 AI使用情况课前调研问卷")
+    st.info("老师您好！数据将实时同步至分析系统，请放心填写。")
+    
     with st.form("survey_form"):
-        name = st.text_input("请输入您的姓名 *")
-        
+        st.subheader("基本信息")
+        name = st.text_input("请输入您的姓名 *", placeholder="必填")
+
+        st.subheader("问卷内容")
         # 渲染题目
-        a1 = st.radio(QUESTIONS["q1"]["title"], QUESTIONS["q1"]["options"], index=None)
+        a1 = st.radio(QUESTIONS["q1"]["title"] + " *", QUESTIONS["q1"]["options"], index=None)
         
-        st.write(QUESTIONS["q2"]["title"])
+        st.markdown(f"**{QUESTIONS['q2']['title']}**")
         a2 = [opt for opt in QUESTIONS["q2"]["options"] if st.checkbox(opt, key=f"q2_{opt}")]
         
-        st.write(QUESTIONS["q3"]["title"])
+        st.markdown(f"**{QUESTIONS['q3']['title']}**")
         a3 = [opt for opt in QUESTIONS["q3"]["options"] if st.checkbox(opt, key=f"q3_{opt}")]
         
-        st.write(QUESTIONS["q4"]["title"])
+        st.markdown(f"**{QUESTIONS['q4']['title']}**")
         a4 = [opt for opt in QUESTIONS["q4"]["options"] if st.checkbox(opt, key=f"q4_{opt}")]
         
-        a5 = st.radio(QUESTIONS["q5"]["title"], QUESTIONS["q5"]["options"], index=None)
-        a6 = st.radio(QUESTIONS["q6"]["title"], QUESTIONS["q6"]["options"], index=None)
+        a5 = st.radio(QUESTIONS["q5"]["title"] + " *", QUESTIONS["q5"]["options"], index=None)
+        a6 = st.radio(QUESTIONS["q6"]["title"] + " *", QUESTIONS["q6"]["options"], index=None)
 
-        submitted = st.form_submit_button("✅ 提交问卷", type="primary")
+        submitted = st.form_submit_button("✅ 提交问卷", type="primary", use_container_width=True)
+
         if submitted:
-            if not name or not a1 or not a5 or not a6:
-                st.error("⚠️ 请填写必填项（带星号或单选题）")
+            if not name.strip() or not a1 or not a5 or not a6:
+                st.error("⚠️ 姓名和所有单选题（带*号）均为必填项！")
             else:
-                app.submit_response(name, {"q1":a1, "q2":a2, "q3":a3, "q4":a4, "q5":a5, "q6":a6})
-                st.success("🎉 提交成功！数据已同步至 Neo4j 和飞书。")
-                st.balloons()
+                answers = {"q1": a1, "q2": a2, "q3": a3, "q4": a4, "q5": a5, "q6": a6}
+                if app.submit_response(name.strip(), answers):
+                    st.success(f"🎉 提交成功！谢谢 {name.strip()} 老师。")
+                    st.balloons()
 
+# 场景 B：管理后台
 elif role == "🔧 管理员后台 (查看)":
-    st.title("📊 调研结果看板")
-    df = pd.DataFrame(app.get_all_data())
-    if not df.empty:
-        st.metric("已填报人数", len(df))
-        tab1, tab2 = st.tabs(["📈 图表分析", "📋 原始数据"])
-        with tab1:
-            st_pyecharts(plot_pie(df, "q1", "Q1: AI 熟悉程度"), height="400px")
-            st_pyecharts(plot_bar(df, "q2", "Q2: Top 需求"), height="400px")
-        with tab2:
-            st.dataframe(df)
+    # 简单的密码保护（可选，目前使用默认配置中的 ADMIN_PWD）
+    pwd = st.sidebar.text_input("管理密码", type="password")
+    if pwd == ADMIN_PWD:
+        st.title("📊 调研结果实时看板")
+        # 自动刷新
+        st_autorefresh(interval=10000, key="data_refresh")
+        
+        raw_data = app.get_all_data()
+        df = pd.DataFrame(raw_data)
+        
+        if not df.empty:
+            st.metric("已成功参与人数", len(df))
+            tab1, tab2 = st.tabs(["📈 图表可视化", "📋 原始数据明细"])
+            
+            with tab1:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st_pyecharts(plot_pie(df, "q1", "AI 熟悉度分布"), height="400px")
+                with col2:
+                    st_pyecharts(plot_pie(df, "q5", "核心困难分布"), height="400px")
+                
+                st.divider()
+                st_pyecharts(plot_bar(df, "q2", "教师 Top 需求场景"), height="400px")
+            
+            with tab2:
+                st.dataframe(df, use_container_width=True)
+                st.download_button("📥 导出 CSV 备份", df.to_csv(index=False).encode('utf-8-sig'), "survey_export.csv")
+        else:
+            st.info("目前还没有老师填写问卷哦。")
+    elif pwd != "":
+        st.error("密码不正确")
     else:
-        st.info("暂无数据")
+        st.warning("请输入侧边栏的管理密码以查看看板")
