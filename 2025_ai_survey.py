@@ -5,25 +5,23 @@ import datetime
 import time
 import requests
 import json
+# ✨ 新增：用于自动刷新和图表
 from streamlit_autorefresh import st_autorefresh
 from streamlit_echarts import st_pyecharts
 from pyecharts import options as opts
 from pyecharts.charts import Bar, Pie
 
-# ================= 1. 敏感配置信息 (建议通过 Streamlit Secrets 填入) =================
-# 飞书配置
+# ================= 1. 配置与连接 (优先从 Secrets 读取) =================
 FEISHU_APP_ID = st.secrets.get("FEISHU_APP_ID", "cli_a9c1c59555f81ceb")
 FEISHU_APP_SECRET = st.secrets.get("FEISHU_APP_SECRET", "ldR79n02WB6CeA7OVA39af05RFXgEJqG")
 FEISHU_APP_TOKEN = "BUCGbklpfaOob5soBs0cLnxDn5f"
 FEISHU_TABLE_ID = "tblmi3cmtBGbTZJP"
 
-# Neo4j 配置 (使用你提供的凭证)
 NEO4J_URI = st.secrets.get("NEO4J_URI", "neo4j+ssc://7eb127cc.databases.neo4j.io")
 NEO4J_USER = st.secrets.get("NEO4J_USERNAME", "neo4j")
 NEO4J_PWD = st.secrets.get("NEO4J_PASSWORD", "wE7pV36hqNSo43mpbjTlfzE7n99NWcYABDFqUGvgSrk")
 ADMIN_PWD = st.secrets.get("ADMIN_PASSWORD", "admin888")
 
-# 数据库连接缓存
 @st.cache_resource
 def get_driver():
     try:
@@ -31,7 +29,7 @@ def get_driver():
         driver.verify_connectivity()
         return driver
     except Exception as e:
-        st.error(f"❌ 无法连接 Neo4j 数据库: {e}")
+        st.error(f"❌ 数据库连接失败: {e}")
         return None
 
 # ================= 2. 问卷题目定义 =================
@@ -58,28 +56,24 @@ class FeishuService:
     def push_data(name, answers):
         token = FeishuService.get_token()
         if not token: return False
-        
         api_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
         
         def format_cell(q_key, val):
             title = QUESTIONS[q_key]["title"]
             ans = "、".join(val) if isinstance(val, list) else (val if val else "未选")
-            # 题干+答案格式，方便 AI 分析
             return f"题目：{title}\n回答：{ans}"
 
-        payload = {
-            "fields": {
-                "姓名": name,
-                "Q1": format_cell("q1", answers.get("q1")),
-                "Q2": format_cell("q2", answers.get("q2")),
-                "Q3": format_cell("q3", answers.get("q3")),
-                "Q4": format_cell("q4", answers.get("q4")),
-                "Q5": format_cell("q5", answers.get("q5")),
-                "Q6": format_cell("q6", answers.get("q6")),
-                "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            }
-        }
+        payload = {"fields": {
+            "姓名": name,
+            "Q1": format_cell("q1", answers.get("q1")),
+            "Q2": format_cell("q2", answers.get("q2")),
+            "Q3": format_cell("q3", answers.get("q3")),
+            "Q4": format_cell("q4", answers.get("q4")),
+            "Q5": format_cell("q5", answers.get("q5")),
+            "Q6": format_cell("q6", answers.get("q6")),
+            "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        }}
         try:
             res = requests.post(api_url, headers=headers, json=payload)
             return res.json().get("code") == 0
@@ -91,18 +85,12 @@ class SurveyBackend:
         self.driver = get_driver()
 
     def submit_response(self, name, answers):
-        # 1. 存入 Neo4j
         if self.driver:
             with self.driver.session() as session:
                 query = """CREATE (r:SurveyResponse {name: $name, submitted_at: datetime(), 
                            q1: $q1, q2: $q2, q3: $q3, q4: $q4, q5: $q5, q6: $q6})"""
                 session.run(query, name=name, **answers)
-        
-        # 2. 存入 飞书 (AI 友好格式)
-        with st.spinner("正在同步至飞书多维表格..."):
-            success = FeishuService.push_data(name, answers)
-            if success: st.toast("✅ 数据已同步飞书，AI 已就绪分析")
-            else: st.warning("⚠️ Neo4j 已存，但飞书同步失败（请确认机器人已添加至表格）")
+        FeishuService.push_data(name, answers)
 
     def get_all_data(self):
         if not self.driver: return []
@@ -114,11 +102,70 @@ class SurveyBackend:
                     d['submitted_at'] = d['submitted_at'].iso_format().split('.')[0].replace('T', ' ')
             return data
 
-    def reset_database(self):
-        if not self.driver: return
-        with self.driver.session() as session:
-            session.run("MATCH (r:SurveyResponse) DETACH DELETE r").consume()
+# ================= 5. 可视化组件 =================
+def plot_pie(df, col, title):
+    if df.empty: return None
+    counts = df[col].value_counts()
+    data_pair = [list(z) for z in zip(counts.index.tolist(), counts.values.tolist())]
+    return (Pie().add("", data_pair, radius=["35%", "60%"])
+            .set_global_opts(title_opts=opts.TitleOpts(title=title, pos_left="center"))
+            .set_series_opts(label_opts=opts.LabelOpts(formatter="{b}: {c} ({d}%)")))
 
-# ================= 5. 主程序 UI 界面 =================
-# [此处保留你原来的绘图函数 plot_pie, plot_bar 和 Streamlit UI 代码...]
-# 确保在角色切换和表单提交逻辑中调用上面定义的 SurveyBackend 即可。
+def plot_bar(df, col, title):
+    if df.empty: return None
+    all_options = [item for sublist in df[col] for item in (sublist if isinstance(sublist, list) else [sublist])]
+    if not all_options: return None
+    counts = pd.Series(all_options).value_counts().sort_values(ascending=True)
+    return (Bar().add_xaxis(counts.index.tolist()).add_yaxis("人数", counts.values.tolist())
+            .reversal_axis().set_global_opts(title_opts=opts.TitleOpts(title=title)))
+
+# ================= 6. 主程序界面 (UI 渲染部分) =================
+st.set_page_config(page_title="AI 调研问卷", page_icon="📝", layout="wide")
+app = SurveyBackend()
+
+with st.sidebar:
+    st.title("📝 问卷系统")
+    role = st.radio("当前身份", ["👨‍🏫 我是老师 (填报)", "🔧 管理员后台 (查看)"])
+
+if role == "👨‍🏫 我是老师 (填报)":
+    st.header("🤖 AI使用情况课前调研问卷")
+    with st.form("survey_form"):
+        name = st.text_input("请输入您的姓名 *")
+        
+        # 渲染题目
+        a1 = st.radio(QUESTIONS["q1"]["title"], QUESTIONS["q1"]["options"], index=None)
+        
+        st.write(QUESTIONS["q2"]["title"])
+        a2 = [opt for opt in QUESTIONS["q2"]["options"] if st.checkbox(opt, key=f"q2_{opt}")]
+        
+        st.write(QUESTIONS["q3"]["title"])
+        a3 = [opt for opt in QUESTIONS["q3"]["options"] if st.checkbox(opt, key=f"q3_{opt}")]
+        
+        st.write(QUESTIONS["q4"]["title"])
+        a4 = [opt for opt in QUESTIONS["q4"]["options"] if st.checkbox(opt, key=f"q4_{opt}")]
+        
+        a5 = st.radio(QUESTIONS["q5"]["title"], QUESTIONS["q5"]["options"], index=None)
+        a6 = st.radio(QUESTIONS["q6"]["title"], QUESTIONS["q6"]["options"], index=None)
+
+        submitted = st.form_submit_button("✅ 提交问卷", type="primary")
+        if submitted:
+            if not name or not a1 or not a5 or not a6:
+                st.error("⚠️ 请填写必填项（带星号或单选题）")
+            else:
+                app.submit_response(name, {"q1":a1, "q2":a2, "q3":a3, "q4":a4, "q5":a5, "q6":a6})
+                st.success("🎉 提交成功！数据已同步至 Neo4j 和飞书。")
+                st.balloons()
+
+elif role == "🔧 管理员后台 (查看)":
+    st.title("📊 调研结果看板")
+    df = pd.DataFrame(app.get_all_data())
+    if not df.empty:
+        st.metric("已填报人数", len(df))
+        tab1, tab2 = st.tabs(["📈 图表分析", "📋 原始数据"])
+        with tab1:
+            st_pyecharts(plot_pie(df, "q1", "Q1: AI 熟悉程度"), height="400px")
+            st_pyecharts(plot_bar(df, "q2", "Q2: Top 需求"), height="400px")
+        with tab2:
+            st.dataframe(df)
+    else:
+        st.info("暂无数据")
